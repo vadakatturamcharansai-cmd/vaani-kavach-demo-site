@@ -95,11 +95,45 @@ test("timed transcript and automatic security alert", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Suspected bank fraud" })).toBeVisible({ timeout: 20_000 });
 });
 
+const HEALTH = {
+  status: "healthy", model_version: "aasist_multigen5", model_load_ms: 147,
+  calibrated: true, spoof_calibrated: true, receipts_enabled: true,
+};
+const DETECT = {
+  status: "success", classification: "AI_SPOOF", action: "VERIFY",
+  action_reason: "possible synthetic speech — step-up verification required",
+  risk_score: 83, risk_level: "HIGH", spoof_score: 0.9487, confidence: 0.8974,
+  audio_quality: "GOOD", timeline: [{ t: 0, risk: 83 }, { t: 1, risk: 79 }],
+  signals: [], processing_time_ms: 1206,
+  receipt: {
+    receipt_id: "83245fad-e17b-43c1-950f-4c7410d8d5da", issued_at: 1790066004,
+    expires_at: 1790066304, session_id: "VK-64DF9C62", action: "VERIFY",
+    risk_score: 83, risk_level: "HIGH", classification: "AI_SPOOF",
+    model_version: "aasist_multigen5", spoof_score: 0.9487, confidence: 0.8974,
+    audio_quality: "GOOD", signature: "test-signature",
+  },
+};
+
+async function stubDetector(page: Page) {
+  await page.route("**/health", route => route.fulfill({ json: HEALTH }));
+  await page.route("**/api/v1/voice/detect", route => route.fulfill({ json: DETECT }));
+  await page.route("**/api/v1/receipt/verify", async route => {
+    const sent = route.request().postDataJSON();
+    const valid = sent?.risk_score === DETECT.receipt.risk_score;
+    await route.fulfill({ json: { valid, reason: valid ? "signature valid" : "signature does not match — receipt was altered or forged" } });
+  });
+  await page.route("**/api/v1/action/authorize", route => route.fulfill({
+    json: { decision: "STEP_UP", risk_level: "HIGH", final_risk: 100, voice_risk: 83,
+      voice_verified: true, context_risk: 25, context_reasons: [], step_up_methods: ["trusted_callback"] },
+  }));
+}
+
 test("architecture details and original workbench controls", async ({ page }) => {
   const diagnostics: string[] = [];
   page.on("console", message => {
     if (message.type() === "error" || message.type() === "warning") diagnostics.push(message.text());
   });
+  await stubDetector(page);
   await page.goto("/architecture");
   const nodes = page.locator(".architecture-node");
   await expect(nodes).toHaveCount(8);
@@ -116,23 +150,33 @@ test("architecture details and original workbench controls", async ({ page }) =>
     await expect(disclosure).toHaveAttribute("aria-expanded", "false");
   }
   await page.goto("/try-model");
-  await page.getByRole("button", { name: "Record", exact: true }).click();
-  await expect(page.getByText("Recording...")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Send to Inference Engine" })).toBeDisabled();
-  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await expect(page.getByText("Live detector connected — aasist_multigen5")).toBeVisible();
   const [chooser] = await Promise.all([page.waitForEvent("filechooser"), page.getByRole("button", { name: "Upload", exact: true }).click()]);
   await chooser.setFiles({ name: "voice.wav", mimeType: "audio/wav", buffer: Buffer.from("RIFF-test-audio") });
   await expect(page.getByRole("button", { name: "Change File" })).toBeVisible();
   await page.getByRole("button", { name: "Send to Inference Engine" }).click();
-  await expect(page.locator(".workbench-output")).toHaveText("Code 4213");
-  await expect(page.locator("main").getByText("Real AI model integration is in progress. API endpoint not yet available.")).toHaveCount(0);
-  expect(diagnostics.some(message => message.includes("[Code 4213] Audio analysis:") && message.includes("API endpoint not yet available"))).toBe(true);
+  // The verdict on screen is the one the service returned, never a local guess.
+  await expect(page.locator(".workbench-output")).toContainText("AI SPOOF");
+  await expect(page.locator(".workbench-output")).toContainText("83 / 100");
+  await expect(page.locator(".workbench-output")).toContainText("VK-64DF9C62");
+  await expect(page.getByText("Code 4213")).toHaveCount(0);
+
   await page.getByRole("button", { name: "B. API Exchange" }).click();
-  await expect(page.getByRole("heading", { name: "Code 4213" })).toBeVisible();
-  await expect(page.getByText("API Logs Unavailable")).toHaveCount(0);
+  await expect(page.getByText("POST /api/v1/voice/detect")).toBeVisible();
+  await expect(page.locator("pre").first()).toContainText("voice.wav");
+
   await page.getByRole("button", { name: "C. Receipt Security" }).click();
-  await expect(page.getByRole("heading", { name: "Code 4213" })).toBeVisible();
-  await expect(page.getByText("Cryptographic Playground Unavailable")).toHaveCount(0);
+  const receipt = page.getByRole("textbox", { name: "Risk receipt JSON" });
+  await expect(receipt).toHaveValue(/VK-64DF9C62/);
+  await page.getByRole("button", { name: "Verify signature" }).click();
+  await expect(page.getByText("VALID", { exact: true })).toBeVisible();
+  // Editing any field must fail the signature and drop the voice evidence.
+  await receipt.fill((await receipt.inputValue()).replace('"risk_score": 83', '"risk_score": 0'));
+  await page.getByRole("button", { name: "Verify signature" }).click();
+  await expect(page.getByText("signature does not match")).toBeVisible();
+  await page.getByRole("button", { name: /Attempt/ }).click();
+  await expect(page.getByText("STEP_UP", { exact: true })).toBeVisible();
+  expect(diagnostics).toEqual([]);
 });
 
 for (const reducedMotion of ["reduce", "no-preference"] as const) {
